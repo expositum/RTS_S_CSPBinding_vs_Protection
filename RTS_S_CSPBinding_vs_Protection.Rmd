@@ -1,0 +1,393 @@
+---
+title: "RTS/S Malaria vaccine trial, Bootstrap analysis of CSP binding lineage fraction vs Protection status."
+author: "Steve Guerrero, Atreca Inc."
+output: html_notebook
+---
+
+```{r libchunk, echo=FALSE, message=FALSE}
+# library(rmarkdown); render("RTS_S_CSPBinding_vs_Protection.Rmd");
+
+library(data.table);
+library(dplyr);
+library(ggplot2);
+library(gridExtra);
+p0=paste0;
+
+GetProtB_NB_diff = function(bootblindlf){
+	stopifnot(!any(duplicated(bootblindlf$lin)));
+
+	csp_props = bootblindlf %>% 
+		group_by(Protection_primary, ELISA_CSP_binding) %>%
+		summarize(sum_rep_frac = sum(fraction),
+			.groups="drop")  %>%
+		group_by(Protection_primary) %>% 
+		mutate(nd = sum(sum_rep_frac)) %>% 
+		mutate(tot_rep_frac = sum_rep_frac/nd)  %>% ungroup();
+
+	protected_B = ( csp_props %>% filter(Protection_primary=="P") %>%	
+			filter(ELISA_CSP_binding == "Pos") %>% 
+			select(tot_rep_frac)  %>% pull()  )   
+	protected_NB = ( csp_props %>% filter(Protection_primary=="P") %>%	
+			filter(ELISA_CSP_binding == "Neg") %>% 
+			select(tot_rep_frac)  %>% pull()  ) 
+	protected_B_NB_ratio =  protected_B / protected_NB;
+	
+	non_protected_B = 
+		( csp_props %>% filter(Protection_primary=="NP") %>%	
+			filter(ELISA_CSP_binding == "Pos") %>% 
+			select(tot_rep_frac)  %>% pull()  )  
+	non_protected_NB = ( csp_props %>% filter(Protection_primary=="NP") %>%	
+			filter(ELISA_CSP_binding == "Neg") %>% 
+			select(tot_rep_frac)  %>% pull()  )   
+	non_protected_B_NB_ratio = non_protected_B / non_protected_NB;
+	
+	delta = abs(protected_B_NB_ratio - non_protected_B_NB_ratio);
+	return(list(
+		protected_B = protected_B,
+		protected_NB = protected_NB,
+		non_protected_B = non_protected_B,
+		non_protected_NB = non_protected_NB,
+		protected_B_NB_ratio = protected_B_NB_ratio,
+		non_protected_B_NB_ratio = non_protected_B_NB_ratio,
+		stat = delta));
+}
+
+BootstrapLinFrac = function(blinded_data, bootn = 10000,
+		BLas = c("BL","Pos","Neg")[1], StatFunc){
+	attach(blinded_data);
+	# special treatment for borderline
+	bootblindlf = blindlinfrac;
+	bootblindlf$ELISA_CSP_binding[bootblindlf$ELISA_CSP_binding == "BL"] =
+		BLas;
+
+	bootblindlf = bootblindlf %>% 
+		filter(ELISA_CSP_binding %in% c("Neg","Pos"))
+	
+	# is this delta statistically significant?
+	observed = StatFunc(bootblindlf);
+	# bootstrap this statistic to test significance
+	bootstats = as.numeric(rep(NA,bootn));
+	empbinding = bootblindlf$ELISA_CSP_binding;
+	empprotection = bootblindlf %>% 
+		group_by(donor_identifier, Protection_primary) %>% 
+		summarize(.groups="drop");
+	empprotmatch = match(bootblindlf$donor_identifier, 
+		empprotection$donor_identifier);
+
+	for(i in 1:bootn){
+		bootprot = empprotection;
+		bootprot$Protection_primary = sample(empprotection$Protection_primary,
+			replace=T);
+		bootblindlf$Protection_primary = 
+			bootprot$Protection_primary[ empprotmatch ]
+
+		bootblindlf$ELISA_CSP_binding = sample(empbinding,replace=T);
+		bootres = StatFunc(bootblindlf);
+		if(length(bootres$stat)==0){next;}
+		bootstats[i] = bootres$stat;
+	}
+	
+	pval = sum(bootstats>observed$stat,na.rm=T) / sum(!is.na(bootstats));
+	return(list(
+		observed = observed,
+		bootstats = bootstats, 
+		pval = pval,
+		BLas = BLas,
+		bootblindlf = bootblindlf
+	));
+}
+
+```
+
+```{r bootnchunk, echo=FALSE, message=FALSE}
+bootn = 20000;
+```
+
+MIT License.
+
+# Correlation of protection status with assay binding data.
+
+From the blinded trial repertoire data, the *abundant, convergent and persistent* subset of lineages were synthed and tested for binding to CSP by ELISA.
+
+Hypothesis 1: There is a correlation between protection status and the relative proportion of the repertoire associated with binding lineages and non-binding lineages.
+
+## Background
+
+We use the term "pair" which can be misleading as it conjures the idea of some two-tuple, but in this case it refers to a single plasmablast cell, which has a "pair of heavy and light chain sequences".  Think of 1 "pair" as equivalent to 1 single plasmablast cell.
+
+Our data set is composed of 45 donors, each donor has on the order of 100s of pairs and these pairs are grouped into lineages (some degree of similarity, think clusters) within each donor.  Lineages can be as small as a single pair, or as large as dozens of pairs.
+
+369 of these pairs (mostly from larger lineages across all donors) were synthesized and tested for binding to CSP.  The binding measurement for a given pair is presumed to extend to the entire lineage (similar set) of pairs that the assayed pair belongs to.
+
+
+## Lineage fraction definition.
+
+To quantify the "relative abundance" of a lineage, we define the lineage fraction simply:
+
+```
+In the blinded repertoire data:
+	for each donor d:
+		for each donor lineage l:
+			let F(d,l) = (pair count in lineage l for donor d) /
+				(total pair count for donor d)
+			s.t sum over F(d,l) over all l for fixed d = 1
+
+Each lineage l is assigned a binding status from the assay data of:
+
+	binding_status(l):
+		"Pos" for positive binding to CSP by ELISA
+		"Neg" for negative binding to CSP by ELISA
+		"BL"  for borderline/uncertain binding to CSP by ELISA
+		"Unk" for unknown, for lineage that did not have an ab tested.
+
+	NB. We are assuming that the observation of one particular member of a lineage binding CSP is indicative of all members in the lineage also binding.
+
+For each donor assign a protected status from primary challenge data:
+	status(d) = "Protected/P" or "Non-Protected/NP"
+```
+
+## Lineage Fraction vs Protection status, raw data.
+
+By inspection, one can see a trend higher lineage fraction occupied by CSP blinding lineages (squares) in non-protected (NP) than protected (P).
+
+
+```{r rawdatachunk, message=FALSE, fig.width=16, fig.height=8, echo=FALSE}
+blinded_data = list();
+blinded_data$blindlinfrac = fread("./blindlinfrac.csv")
+
+binding_lin_fractions_plot = ggplot(
+	blinded_data$blindlinfrac %>% 
+		mutate(did = as.factor(donor_identifier)), 
+		aes( x = did, y = fraction, 
+		shape = ELISA_CSP_binding, color = ELISA_CSP_binding,
+		size= 1
+		) )  + 
+	geom_jitter(position=position_jitter(0.4)) +
+	scale_color_manual(values = c("Unk" = "#AAAAAA", "Pos"="#0000FF", 
+		"Neg" = "#FF0000", "BL" = "#777777")) +
+	scale_shape_manual(values = c("Unk" = 1, "Pos"=3,"Neg" = 2, "BL" = 4)) +
+	scale_alpha_manual(values = c("Unk" = 0.5, "Pos"=1,"Neg" = 1, "BL" = 1)) +
+	guides(size="none", alpha="none") +
+	facet_grid(. ~ Protection_primary) + 
+	ggtitle(p0("Fig 1.\n",
+		"repertoire fractions per lineage ",
+		" for binding, non-binding and unknown lineages,\n",
+		" by donor id and protection status"));
+
+print(binding_lin_fractions_plot);
+
+```
+
+## Test statistic definition.
+
+Chi-by-eye, it looks like in Fig 1, for the protected group, the triangles are higher than the +'s than they are in the non-protected group.  How can we quantify this?
+
+Consider only the set of lineages of binding status in ("Pos","Neg") in the blinded repertoire data.
+
+```
+Protected:
+
+	let LFPosProt = sum of F(d,l) where binding_status(l) = "Pos"
+		and donor_status(d) = "Protected"
+	let LFNegProt = sum of F(d,l) where binding_status(l) = "Neg"
+		and donor_status(d) = "Protected"
+	
+	let LFProtRatio = LFPosProt/LFNegProt
+
+	LFProtRatio in the relative proportion of the binding vs non-binding repertoire in the protected donors.
+
+Non-protected:
+
+	let LFPosNonProt = sum of F(d,l) where binding_status(l) = "Pos"
+		and donor_status(d) = "Non-Protected"
+	let LFNegNonProt = sum of F(d,l) where binding_status(l) = "Neg"
+		and donor_status(d) = "Non-Protected"
+	
+	let LFNonProtRatio = LFPosNonProt/LFNegNonProt
+
+	LFNonProtRatio in the relative proportion of the binding vs non-binding repertoire in the non-protected donors.
+
+	The statistic we want to test for significance.
+
+		LFRatioDelta = abs(LFPosNonProt - LFNegNonProt)
+```
+## Bootstrap p-value.
+
+Is this difference, LFRatioDelta, statistically significant?
+
+Generate `r bootn` bootstrap samples by random sampling with replacement the Prot and non prot status of donors and binding and not binding status of lineages.
+
+How often do we see LFRatioDelta by chance, in bootstrap/random resampling (with replacement) of the Binding/Non-binding and Protected/Non-protected labels?
+
+```{r bootstrapsamplechunk, message=FALSE, fig.width=16, fig.height=8, echo=FALSE}
+cat("Example bootstrap sample\n");
+bootset = BootstrapLinFrac(blinded_data, bootn = 1, BLas = "BL", GetProtB_NB_diff);
+
+rawplot = ggplot(
+	blinded_data$blindlinfrac %>% 
+		filter(ELISA_CSP_binding %in% c("Pos","Neg")) %>% 
+		mutate(did = as.factor(donor_identifier)), 
+		aes( x = did, y = fraction, 
+		shape = ELISA_CSP_binding, color = ELISA_CSP_binding,
+		size= 1
+		) )  + 
+	geom_jitter(position=position_jitter(0.4)) +
+	scale_color_manual(values = c("Unk" = "#AAAAAA", "Pos"="#0000FF", 
+		"Neg" = "#FF0000", "BL" = "#777777")) +
+	scale_shape_manual(values = c("Unk" = 1, "Pos"=3,"Neg" = 2, "BL" = 4)) +
+	scale_alpha_manual(values = c("Unk" = 0.5, "Pos"=1,"Neg" = 1, "BL" = 1)) +
+	guides(size="none", alpha="none") +
+	facet_grid(. ~ Protection_primary) + 
+	ggtitle(p0(
+		"repertoire fractions for binding, non-binding and unknown lineages,\n",
+		" by donor id and protection status"));
+
+bootplot = ggplot(
+	bootset$bootblindlf %>% 
+		mutate(did = as.factor(donor_identifier)), 
+		aes( x = did, y = fraction, 
+		shape = ELISA_CSP_binding, color = ELISA_CSP_binding,
+		size= 1
+		) )  + 
+	scale_color_manual(values = c("Unk" = "#AAAAAA", "Pos"="#0000FF", 
+		"Neg" = "#FF0000", "BL" = "#777777")) +
+	scale_shape_manual(values = c("Unk" = 1, "Pos"=3,"Neg" = 2, "BL" = 4)) +
+	scale_alpha_manual(values = c("Unk" = 0.5, "Pos"=1,"Neg" = 1, "BL" = 1)) +
+	geom_jitter(position=position_jitter(0.4)) +
+	guides(size="none", alpha="none") +
+	facet_grid(. ~ Protection_primary) + 
+	ggtitle(p0(
+		"repertoire fractions for binding, non-binding and unknown lineages,\n",
+		" by donor id and protection status.\n",
+		" one bootstrap sample "));
+
+grid.arrange(rawplot, bootplot, nrow=2)
+
+```
+
+# Border line binding cases.
+
+There are 201 "Neg" CSP binders, 139 "Pos" CSP binders and 29 "borderline" binders.  
+
+We can choose to treat borderline samples as either ignored/"BL", "Pos", or "Neg", but, as shown below, it doesn't change the significance of the statistic.
+
+
+```{r bootstrapchunk, message=FALSE, echo=FALSE}
+#########################################################################
+
+print(table(blinded_data$blindlinfrac$ELISA_CSP_binding));
+
+BootByType = function(BLas){
+	bootset = BootstrapLinFrac(blinded_data, bootn, BLas = BLas, 
+		StatFunc = GetProtB_NB_diff);
+	return(bootset)
+}
+
+PlotBootSet = function(bootset){
+	BLas = bootset$BLas;
+	cat(p0("BL as ",BLas,":\n"),fill=T);
+	cat(p0("\tobserved protected_B = ", bootset$observed$protected_B,"\n"),fill=T);
+	cat(p0("\tobserved protected_NB = ", bootset$observed$protected_NB,"\n"),fill=T);
+	cat(p0("\tobserved non_protected_B = ", bootset$observed$non_protected_B,
+		"\n"),fill=T);
+	cat(p0("\tobserved non_protected_NB = ", bootset$observed$non_protected_NB,
+		"\n"),fill=T);
+	
+	cat(p0("\tobserved protected_B_NB_ratio:",
+		bootset$observed$protected_B_NB_ratio,"\n"),fill=T);
+	cat(p0("\tobserved non_protected_B_NB_ratio:",
+		bootset$observed$non_protected_B_NB_ratio,"\n"),fill=T);
+	cat(p0("\tobserved delta: ",bootset$observed$stat,"\n"),fill=T)
+	cat(p0("\tboot p-value = sum(bootdeltas > observed delta): ",
+		bootset$pval,"\n"),fill=T);
+
+	suppressWarnings( print(
+	ggplot(data.table(bd = bootset$bootstats), aes(x=bd)) + 
+		geom_histogram(bins=100) + 
+		geom_vline(xintercept = bootset$observed$stat) + 
+		geom_text(aes(x=bootset$observed$stat, 
+			label="observed stat", y=20), colour="blue", 
+			angle=90, vjust=1.2) + 
+		annotate(geom = "vline",
+			xintercept = c(bootset$observed$stat),
+			linetype = c("dashed")) +
+		xlab(p0(
+			" abs( (total B/NB lineage fraction for Protected) - \n",
+			"      (total B/NB lineage fraction for Non-Protected) ) ")) +
+		scale_y_log10()  + 
+		ggtitle(p0("Bootstrap distibution of \n",
+			"B/NB lineage fraction in Protected vs Non-Protected donor.\n",
+			"(BL as ",BLas,")",
+			" p-value of observed statistic = ",bootset$pval
+			)) ));
+}
+
+```
+---------------------------------------------------------------------------
+
+Bootstrap samples are cached in `bootset*.RDS` files. Remove the RDS files to rerun the bootstrap process.
+
+```{r bootrunBLchunk, message=FALSE, echo=FALSE}
+if(!file.exists("bootset_BL.RDS")){
+	bootset_BL = BootByType("BL");
+	saveRDS(bootset_BL,"bootset_BL.RDS");
+}else{
+	bootset_BL = readRDS("bootset_BL.RDS");
+}
+```
+
+---------------------------------------------------------------------------
+```{r bootrunPoschunk,message=FALSE, echo=FALSE}
+if(!file.exists("bootset_Pos.RDS")){
+	bootset_Pos = BootByType("Pos");
+	saveRDS(bootset_Pos,"bootset_Pos.RDS");
+}else{
+	bootset_Pos = readRDS("bootset_Pos.RDS");
+}
+```
+---------------------------------------------------------------------------
+
+
+```{r bootrunNegchunk, message=FALSE, echo=FALSE}
+if(!file.exists("bootset_Neg.RDS")){
+	bootset_Neg = BootByType("Neg");
+	saveRDS(bootset_Neg,"bootset_Neg.RDS");
+}else{
+	bootset_Neg = readRDS("bootset_Neg.RDS");
+}
+```
+
+---------------------------------------------------------------------------
+Observed statistic is stastically significant under any treatment of borderline cases:
+
+```{r plotbootschunk,message=FALSE, echo=FALSE}
+
+PlotBootSet(bootset_BL);
+PlotBootSet(bootset_Pos);
+PlotBootSet(bootset_Neg);
+
+```
+---------------------------------------------------------------------------
+Is the total lineage fraction for binders higher in Protected than Non-Protected?
+
+Yes:
+
+```{r linfractionchunk,echo=FALSE }
+
+	csp_bind_frac = blinded_data$blindlinfrac %>% 
+		group_by(Protection_primary, ELISA_CSP_binding) %>%
+		summarize(sum_rep_frac = sum(fraction),
+			.groups="drop")  %>%
+		group_by(Protection_primary) %>% 
+		mutate(nd = sum(sum_rep_frac)) %>% 
+		mutate(tot_rep_frac = sum_rep_frac/nd)  %>% ungroup();
+	print( csp_bind_frac %>% filter(ELISA_CSP_binding == "Pos") %>%
+		select(Protection_primary, ELISA_CSP_binding, nd, tot_rep_frac) %>%
+		as.data.frame
+		);
+
+```
+
+---------------------------------------------------------------------------
+EOF
+---------------------------------------------------------------------------
